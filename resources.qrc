@@ -2,8 +2,8 @@
     <qresource prefix="/">
         <file alias="appicon.ico">resources/appicon.ico</file>
         <file alias="style.qss">styles/style.qss</file>
-        <file alias="Pay.png">resources/PayNew.png</file>
-        <file alias="Month.png">resources/Month.png</file>
+        <file alias="Pay.png">resources/PayNew_small.png</file>
+        <file alias="Month.png">resources/Month_small.png</file>
         <file alias="icons/down_arrow.png">resources/Arrowhead-Down.png</file>
     </qresource>
 </RCC>

@@ -6,6 +6,7 @@
 #include "gui/vehicledialog.h"
 #include "gui/monthpassdialog.h"
 #include "core/datamanager.h"
+#include "core/plateutil.h"
 #include <QMessageBox>
 #include <QStandardItemModel>
 #include <QInputDialog>
@@ -64,7 +65,7 @@ void MainWindow::on_pushButtonEditVehicle_clicked()
 
     int row = selectedRows.first().row();
     QString plate = ui->tableViewVehicles->model()->index(row, 0).data().toString();
-    Vehicle* vehicleToEdit = DataManager::instance().findVehicleByPlate(plate);
+    auto vehicleToEdit = DataManager::instance().findVehicleByPlate(plate);
 
     if (!vehicleToEdit) return; // Should not happen
 
@@ -76,7 +77,6 @@ void MainWindow::on_pushButtonEditVehicle_clicked()
         DataManager::instance().updateVehicle(updatedVehicle);
         updateVehicleView();
     }
-    delete vehicleToEdit; // Free memory
 }
 
 void MainWindow::on_pushButtonDeleteVehicle_clicked()
@@ -113,7 +113,7 @@ void MainWindow::on_pushButtonChangePassword_clicked()
 {
     ChangePasswordDialog dlg(this);
     if (dlg.exec() == QDialog::Accepted) {
-        if (dlg.getOldPassword() != m_currentUser.password) {
+        if (DataManager::instance().validateUser(m_currentUser.username, dlg.getOldPassword()) == UserRole::Invalid) {
             QMessageBox::warning(this, "失败", "旧密码不正确");
             return;
         }
@@ -123,6 +123,7 @@ void MainWindow::on_pushButtonChangePassword_clicked()
 
         if (DataManager::instance().updateUser(updatedUser)) {
             m_currentUser = updatedUser; // Update current user info
+            m_currentUser.password = DataManager::hashPassword(dlg.getNewPassword());
             QMessageBox::information(this, "成功", "密码修改成功");
         } else {
             QMessageBox::warning(this, "失败", "更新密码时出错");
@@ -153,18 +154,18 @@ void MainWindow::displayMyVehicles()
         QGroupBox *groupBox = new QGroupBox(vehicle.plate, this);
         QString color;
         if (vehicle.vehicle_type == "蓝") {
-            color = "#0066cc";
+            color = "#90CAF9";
         } else if (vehicle.vehicle_type == "绿") {
-            color = "#32f08c";
+            color = "#8CE0A8";
         } else if (vehicle.vehicle_type == "黄") {
-            color = "#f8b515";
+            color = "#FFD66E";
         }
-        groupBox->setStyleSheet(QString("QGroupBox { border: 2px solid %1; margin-top: 1.5em; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px 0 3px; }").arg(color));
+        groupBox->setStyleSheet(QString("QGroupBox { border: 1px solid %1; border-radius: 16px; background-color: #211F26; margin-top: 1.4em; padding: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 16px; padding: 0 6px; color: %1; font-weight: 600; background-color: #211F26; }").arg(color));
         QFormLayout *formLayout = new QFormLayout(groupBox);
 
         if (vehicle.isMonthlyPassHolder()) {
             QLabel* expiryLabel = new QLabel(QString("月卡到期时间: %1").arg(vehicle.pass_expiry_date.toString("yyyy-MM-dd")));
-            expiryLabel->setStyleSheet("font-size: 12pt; font-weight: bold; color: #2ecc71;");
+            expiryLabel->setStyleSheet("font-size: 14px; font-weight: 600; color: #8CE0A8;");
             formLayout->addRow(expiryLabel);
         } else {
             QLabel* entryTimeValue = new QLabel(vehicle.entryTime.toString("yyyy-MM-dd hh:mm:ss"));
@@ -205,9 +206,22 @@ void MainWindow::on_pushButtonBindVehicle_clicked()
 {
     BindVehicleDialog dlg(this);
     if (dlg.exec() == QDialog::Accepted) {
-        QString plate = dlg.getPlateNumber();
-        Vehicle *vehicle = DataManager::instance().findVehicleByPlate(plate);
+        QString plate = normalizePlate(dlg.getPlateNumber());
+        if (!isValidPlate(plate)) {
+            QMessageBox::warning(this, "绑定失败", "车牌格式不正确（示例：苏A12345）。");
+            return;
+        }
+        auto vehicle = DataManager::instance().findVehicleByPlate(plate);
         if (vehicle) {
+            if (!vehicle->owner.isEmpty() && vehicle->owner != m_currentUser.username) {
+                QMessageBox::warning(this, "绑定失败", QString("车辆 %1 已被用户 %2 绑定。").arg(plate).arg(vehicle->owner));
+                return;
+            }
+            if (vehicle->owner == m_currentUser.username) {
+                QMessageBox::information(this, "绑定成功", QString("车辆 %1 已绑定到您的账户。").arg(plate));
+                displayMyVehicles();
+                return;
+            }
             vehicle->owner = m_currentUser.username;
             if (DataManager::instance().updateVehicle(*vehicle)) {
                 QMessageBox::information(this, "绑定成功", "车辆绑定成功！");
@@ -215,7 +229,6 @@ void MainWindow::on_pushButtonBindVehicle_clicked()
             } else {
                 QMessageBox::warning(this, "绑定失败", "更新车辆信息时出错。");
             }
-            delete vehicle;
         } else {
             QMessageBox::warning(this, "绑定失败", "未找到该车牌号的车辆。");
         }
@@ -255,12 +268,13 @@ void MainWindow::handlePayment(const QString &plate)
     connect(paidButton, &QPushButton::clicked, &paymentDialog, &QDialog::accept);
 
     if (paymentDialog.exec() == QDialog::Accepted) {
-        Vehicle* v = DataManager::instance().findVehicleByPlate(plate);
-        if(v) {
-            double fee = v->calculateFee();
-            DataManager::instance().logTransaction(plate, fee, "temporary");
-            delete v;
+        auto v = DataManager::instance().findVehicleByPlate(plate);
+        if (!v) {
+            QMessageBox::warning(this, "操作失败", QString("未找到车牌 %1 的在场车辆，缴费未生效。").arg(plate));
+            return;
         }
+        double fee = v->calculateFee();
+        DataManager::instance().logTransaction(plate, fee, "temporary");
 
         DataManager::instance().endParkingSession(plate);
         QMessageBox::information(this, "操作成功", "缴费成功，车辆已离场。");
@@ -268,6 +282,7 @@ void MainWindow::handlePayment(const QString &plate)
         ui->groupBoxResult->setVisible(false);
         ui->pushButtonPay->setVisible(false);
         ui->lineEditQueryPlate->clear();
+        m_queriedPlate.clear();
         displayMyVehicles();
         updateVehicleView(); // Also update admin view if open
     }
@@ -340,6 +355,7 @@ using namespace easypr;
 std::string colorToString(easypr::Color color) {
     switch (color) {
         case easypr::BLUE: return "蓝";
+        case easypr::GREEN: return "绿";
         case easypr::YELLOW: return "黄";
         case easypr::WHITE: return "白";
         default: return "未知";
@@ -348,23 +364,18 @@ std::string colorToString(easypr::Color color) {
 
 QString MainWindow::formatPlateNumber(const std::string &rawPlate)
 {
-    // Use fromLocal8Bit to handle potential GBK encoding from EasyPR.
+    // EasyPR 输出形如 "蓝牌:苏A12345"；去掉颜色前缀与噪音字符后校验。
     QString plate = QString::fromLocal8Bit(rawPlate.c_str());
-
-    // Regex to find one Chinese character followed by one uppercase letter and 5 alphanumeric chars.
-    QRegularExpression re("[\u4e00-\u9fa5]{1}[A-Z]{1}[A-Z0-9]{5}");
-    QRegularExpressionMatch match = re.match(plate);
-
-    if (match.hasMatch()) {
-        QString validPart = match.captured(0);
-        QString province = validPart.left(1);
-        QString letter = validPart.mid(1, 1);
-        QString rest = validPart.right(5);
-        return QString("%1%2:%3").arg(province).arg(letter).arg(rest);
-    } else {
-        // Fallback for plates that don't match the standard pattern
-        return plate; 
+    const int colon = plate.indexOf(':');
+    if (colon >= 0) {
+        plate = plate.mid(colon + 1);
     }
+    plate = normalizePlate(plate);
+    if (isValidPlate(plate)) {
+        return plate;
+    }
+    // 识别失败时 EasyPR 可能只输出颜色串（如“蓝”），这里统一视为无效
+    return QString();
 }
 
 void MainWindow::on_pushButtonUpload_clicked()
@@ -384,14 +395,38 @@ void MainWindow::on_pushButtonUpload_clicked()
     pr.setDetectType(PR_DETECT_CMSER | PR_DETECT_COLOR);
     std::vector<CPlate> plateVec;
     cv::Mat image = cv::imread(filePath.toStdString());
+    if (image.empty()) {
+        ui->labelRecognitionResult->setText("图片读取失败，请确认文件有效");
+        QMessageBox::warning(this, "识别失败", "无法读取所选图片。");
+        return;
+    }
     int result = pr.plateRecognize(image, plateVec);
 
     if (result == 0 && !plateVec.empty()) {
         CPlate plate = plateVec.front();
         QString formattedPlate = formatPlateNumber(plate.getPlateStr());
+        if (formattedPlate.isEmpty()) {
+            ui->labelRecognitionResult->setText("识别结果无效，请尝试更清晰的图片");
+            QMessageBox::warning(this, "识别失败", "未能识别出有效车牌。");
+            return;
+        }
         std::string colorStr = colorToString(plate.getPlateColor());
 
         ui->labelRecognitionResult->setText(QString("识别成功: %1 (%2)").arg(formattedPlate).arg(QString::fromStdString(colorStr)));
+
+        if (colorStr != "蓝" && colorStr != "绿" && colorStr != "黄") {
+            QMessageBox::warning(this, "录入失败", QString("无法确定车牌颜色（%1），暂不支持录入该车辆。").arg(QString::fromStdString(colorStr)));
+            return;
+        }
+
+        // 同牌临时车已在场时拒绝，避免重置计费起点
+        auto existing = DataManager::instance().findVehicleByPlate(formattedPlate);
+        const bool isParked = existing && existing->entryTime.isValid();
+        const bool isMonthly = existing && existing->isMonthlyPassHolder();
+        if (existing && isParked && !isMonthly) {
+            QMessageBox::warning(this, "录入失败", QString("检测到相同车牌的临时车辆 %1 已在场，请确认信息").arg(formattedPlate));
+            return;
+        }
 
         // Add to database
         Vehicle newVehicle;
@@ -401,12 +436,15 @@ void MainWindow::on_pushButtonUpload_clicked()
         if (colorStr == "蓝") {
             newVehicle.vehicle_type = "蓝";
             newVehicle.vehicle_color = "蓝";
+        } else if (colorStr == "绿") {
+            newVehicle.vehicle_type = "绿";
+            newVehicle.vehicle_color = "绿";
         } else if (colorStr == "黄") {
             newVehicle.vehicle_type = "黄";
             newVehicle.vehicle_color = "黄";
-        } else {
-            newVehicle.vehicle_type = "蓝"; // Default to blue
-            newVehicle.vehicle_color = "蓝";
+        }
+        if (existing) {
+            newVehicle.owner = existing->owner; // 已绑定车辆入场时保留车主
         }
 
         DataManager::instance().addVehicle(newVehicle);
@@ -431,6 +469,7 @@ void MainWindow::on_pushButtonUpload_Leave_clicked()
     if (imagePreviewLabel) {
         imagePreviewLabel->setPixmap(pixmap.scaled(imagePreviewLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     }
+    QLabel *resultLabel = this->findChild<QLabel*>("labelRecognitionResult_Leave");
 
     // Perform plate recognition
     CPlateRecognize pr;
@@ -438,23 +477,34 @@ void MainWindow::on_pushButtonUpload_Leave_clicked()
     pr.setDetectType(PR_DETECT_CMSER | PR_DETECT_COLOR);
     std::vector<CPlate> plateVec;
     cv::Mat image = cv::imread(filePath.toStdString());
+    if (image.empty()) {
+        if (resultLabel) {
+            resultLabel->setText("图片读取失败，请确认文件有效");
+        }
+        QMessageBox::warning(this, "识别失败", "无法读取所选图片。");
+        return;
+    }
     int result = pr.plateRecognize(image, plateVec);
-
-    QLabel *resultLabel = this->findChild<QLabel*>("labelRecognitionResult_Leave");
 
     if (result == 0 && !plateVec.empty()) {
         CPlate plate = plateVec.front();
         QString formattedPlate = formatPlateNumber(plate.getPlateStr());
+        if (formattedPlate.isEmpty()) {
+            if (resultLabel) {
+                resultLabel->setText("识别结果无效，请尝试更清晰的图片");
+            }
+            QMessageBox::warning(this, "识别失败", "未能识别出有效车牌。");
+            return;
+        }
 
         if (resultLabel) {
             resultLabel->setText(QString("识别成功: %1").arg(formattedPlate));
         }
 
         // Find vehicle and handle payment/exit
-        Vehicle *vehicle = DataManager::instance().findVehicleByPlate(formattedPlate);
+        auto vehicle = DataManager::instance().findVehicleByPlate(formattedPlate);
         if (vehicle) {
             handlePayment(formattedPlate);
-            delete vehicle; // handlePayment has its own logic, but we must delete the object we found here.
         } else {
             QMessageBox::warning(this, "操作失败", "未在停车场中找到该车牌号的车辆。");
         }
@@ -529,7 +579,7 @@ void MainWindow::on_actionAbout_triggered()
     aboutBox.setIcon(QMessageBox::Information);
     // Apply the stylesheet to this specific message box
     QString style;
-    QFile file(":/styles/style.qss");
+    QFile file(":/style.qss");
     if (file.open(QFile::ReadOnly | QFile::Text)) {
         style = QLatin1String(file.readAll());
     }
@@ -545,24 +595,24 @@ void MainWindow::on_pushButtonAddVehicle_clicked()
     }
 
     Vehicle newVehicle = dlg.getVehicle();
-    Vehicle* existingVehicle = DataManager::instance().findVehicleByPlate(newVehicle.plate);
+    newVehicle.plate = normalizePlate(newVehicle.plate);
+    if (!isValidPlate(newVehicle.plate)) {
+        QMessageBox::warning(this, "录入失败", "车牌格式不正确（示例：苏A12345，新能源8位如苏AD12345）。");
+        return;
+    }
+    auto existingVehicle = DataManager::instance().findVehicleByPlate(newVehicle.plate);
 
     if (existingVehicle) {
         bool isParked = !existingVehicle->entryTime.toString().isEmpty();
         bool isExistingVehicleMonthly = existingVehicle->pass_expiry_date.isValid() && QDateTime::currentDateTime() < existingVehicle->pass_expiry_date;
         if (!isExistingVehicleMonthly && isParked) {
             QMessageBox::warning(this, "录入失败", "检测到相同车牌的临时车辆已在场，请确认信息");
-            delete existingVehicle;
             return; // Abort
         }
     }
 
     DataManager::instance().addVehicle(newVehicle);
     updateVehicleView();
-
-    if (existingVehicle) {
-        delete existingVehicle;
-    }
 }
 
 void MainWindow::updateVehicleView()
@@ -575,11 +625,11 @@ void MainWindow::updateVehicleView()
         QList<QStandardItem *> items;
         QStandardItem *plateItem = new QStandardItem(vehicle.plate);
         if (vehicle.vehicle_color == "蓝") {
-            plateItem->setData(QColor("#0066cc"), Qt::ForegroundRole);
+            plateItem->setData(QColor("#90CAF9"), Qt::ForegroundRole);
         } else if (vehicle.vehicle_color == "绿") {
-            plateItem->setData(QColor("#32f08c"), Qt::ForegroundRole);
+            plateItem->setData(QColor("#8CE0A8"), Qt::ForegroundRole);
         } else if (vehicle.vehicle_color == "黄") {
-            plateItem->setData(QColor("#f8b515"), Qt::ForegroundRole);
+            plateItem->setData(QColor("#FFD66E"), Qt::ForegroundRole);
         }
         QFont font = plateItem->font();
         font.setBold(true);
@@ -617,27 +667,33 @@ void MainWindow::updateVehicleView()
 
 void MainWindow::on_pushButtonQuery_clicked()
 {
-    QString plate = ui->lineEditQueryPlate->text().trimmed();
+    QString plate = normalizePlate(ui->lineEditQueryPlate->text());
     if (plate.isEmpty()) {
         QMessageBox::warning(this, "查询失败", "请输入车牌号");
         return;
     }
+    if (!isValidPlate(plate)) {
+        QMessageBox::warning(this, "查询失败", "车牌格式不正确（示例：苏A12345，新能源8位如苏AD12345）。");
+        return;
+    }
 
-    Vehicle *vehicle = DataManager::instance().findVehicleByPlate(plate);
+    m_queriedPlate.clear();
+    auto vehicle = DataManager::instance().findVehicleByPlate(plate);
 
     if (vehicle) {
         bool isParked = vehicle->entryTime.isValid();
 
         QString color;
         if (vehicle->vehicle_type == "蓝") {
-            color = "#0066cc";
+            color = "#90CAF9";
         } else if (vehicle->vehicle_type == "绿") {
-            color = "#32f08c";
+            color = "#8CE0A8";
         } else if (vehicle->vehicle_type == "黄") {
-            color = "#f8b515";
+            color = "#FFD66E";
         }
         ui->labelPlateValue->setText(QString("<font color='%1'><b>%2</b></font>").arg(color).arg(vehicle->plate));
-        ui->groupBoxResult->setStyleSheet(QString("QGroupBox { border: 2px solid %1; margin-top: 1.5em; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px 0 3px; }").arg(color));
+        m_queriedPlate = vehicle->plate; // 保存纯文本车牌供缴费使用
+        ui->groupBoxResult->setStyleSheet(QString("QGroupBox { border: 1px solid %1; border-radius: 16px; background-color: #211F26; margin-top: 1.4em; padding: 12px; } QGroupBox::title { subcontrol-origin: margin; left: 16px; padding: 0 6px; color: %1; font-weight: 600; background-color: #211F26; }").arg(color));
         ui->groupBoxResult->setVisible(true);
 
         if (isParked) {
@@ -677,8 +733,6 @@ void MainWindow::on_pushButtonQuery_clicked()
             ui->pushButtonPay->setVisible(false);
         }
         
-        delete vehicle; // IMPORTANT: Free the memory after use
-
     } else {
         QMessageBox::information(this, "查询结果", "未在系统中找到该车牌号");
         ui->groupBoxResult->setVisible(false);
@@ -688,7 +742,7 @@ void MainWindow::on_pushButtonQuery_clicked()
 
 void MainWindow::on_pushButtonPay_clicked()
 {
-    QString plateToPay = ui->labelPlateValue->text();
+    QString plateToPay = m_queriedPlate;
     if(plateToPay.isEmpty()) return;
 
     // If it's a monthly user, just end the parking session without payment
@@ -698,6 +752,7 @@ void MainWindow::on_pushButtonPay_clicked()
         ui->groupBoxResult->setVisible(false);
         ui->pushButtonPay->setVisible(false);
         ui->lineEditQueryPlate->clear();
+        m_queriedPlate.clear();
         updateVehicleView(); // Refresh admin view
         displayMyVehicles(); // Refresh my page view
     } else { // Otherwise, go to payment
@@ -818,18 +873,19 @@ void MainWindow::updateStatisticsPage()
     int greenCount = counts.value("绿");
     int yellowCount = counts.value("黄");
     int totalCount = blueCount + greenCount + yellowCount;
-    int maxOccupancy = 50;
-    int emptyCount = maxOccupancy - totalCount;
+    int maxOccupancy = DataManager::instance().parkingCapacity();
+    if (maxOccupancy < 1) maxOccupancy = 1;
+    int emptyCount = qMax(0, maxOccupancy - totalCount);
 
     ui->occupancyStatsLabel->setText(QString("总车位: %1 | 燃油车: %2 | 新能源: %3 | 大型车: %4 | 空余: %5")
                                    .arg(maxOccupancy).arg(blueCount).arg(greenCount).arg(yellowCount).arg(emptyCount));
 
     QList<QString> occupancyParts;
     QList<double> occupancyWidths;
-    if (blueCount > 0) { occupancyParts.append("background-color: #0066cc;"); occupancyWidths.append(blueCount * 100.0 / maxOccupancy); }
-    if (greenCount > 0) { occupancyParts.append("background-color: #32f08c;"); occupancyWidths.append(greenCount * 100.0 / maxOccupancy); }
-    if (yellowCount > 0) { occupancyParts.append("background-color: #f8b515;"); occupancyWidths.append(yellowCount * 100.0 / maxOccupancy); }
-    if (emptyCount > 0) { occupancyParts.append("background-color: #262626;"); occupancyWidths.append(emptyCount * 100.0 / maxOccupancy); }
+    if (blueCount > 0) { occupancyParts.append("background-color: #90CAF9;"); occupancyWidths.append(qMin(100.0, blueCount * 100.0 / maxOccupancy)); }
+    if (greenCount > 0) { occupancyParts.append("background-color: #8CE0A8;"); occupancyWidths.append(qMin(100.0, greenCount * 100.0 / maxOccupancy)); }
+    if (yellowCount > 0) { occupancyParts.append("background-color: #FFD66E;"); occupancyWidths.append(qMin(100.0, yellowCount * 100.0 / maxOccupancy)); }
+    if (emptyCount > 0) { occupancyParts.append("background-color: #36343B;"); occupancyWidths.append(qMin(100.0, emptyCount * 100.0 / maxOccupancy)); }
 
     QString occupancyHtml = "<table width='100%' height='100%' style='border-collapse: collapse;'><tr>";
     for(int i = 0; i < occupancyParts.size(); ++i) {
@@ -859,11 +915,11 @@ void MainWindow::updateStatisticsPage()
     QList<QString> revenueParts;
     QList<double> revenueWidths;
     if (totalRevenue > 0) {
-        if (tempRevenue > 0) { revenueParts.append("background-color: #f8b515;"); revenueWidths.append(tempRevenue * 100.0 / totalRevenue); }
-        if (monthlyRevenue > 0) { revenueParts.append("background-color: #32f08c;"); revenueWidths.append(monthlyRevenue * 100.0 / totalRevenue); }
+        if (tempRevenue > 0) { revenueParts.append("background-color: #FFD66E;"); revenueWidths.append(tempRevenue * 100.0 / totalRevenue); }
+        if (monthlyRevenue > 0) { revenueParts.append("background-color: #8CE0A8;"); revenueWidths.append(monthlyRevenue * 100.0 / totalRevenue); }
     }
     if (revenueParts.isEmpty()) {
-        revenueParts.append("background-color: #262626;"); revenueWidths.append(100.0);
+        revenueParts.append("background-color: #36343B;"); revenueWidths.append(100.0);
     }
 
     QString revenueHtml = "<table width='100%' height='100%' style='border-collapse: collapse;'><tr>";
@@ -893,7 +949,7 @@ void MainWindow::on_pushButtonIntelligentBind_clicked()
     QLabel *imagePreviewLabel = new QLabel();
     imagePreviewLabel->setObjectName("labelImagePreview");
     imagePreviewLabel->setFixedSize(400, 300);
-    imagePreviewLabel->setStyleSheet("border: 1px solid #4f5b6a; background-color: #2d2d2d;");
+    imagePreviewLabel->setStyleSheet("border: 1px solid #49454F; border-radius: 16px; background-color: #211F26; color: #938F99;");
     imagePreviewLabel->setAlignment(Qt::AlignCenter);
     imagePreviewLabel->setText("图片预览");
 
@@ -927,19 +983,32 @@ void MainWindow::on_pushButtonIntelligentBind_clicked()
         pr.setDetectType(PR_DETECT_CMSER | PR_DETECT_COLOR);
         std::vector<CPlate> plateVec;
         cv::Mat image = cv::imread(filePath.toStdString());
+        if (image.empty()) {
+            QMessageBox::warning(&bindDialog, "识别失败", "无法读取所选图片。");
+            return;
+        }
         int result = pr.plateRecognize(image, plateVec);
 
         if (result == 0 && !plateVec.empty()) {
             CPlate plate = plateVec.front();
             QString formattedPlate = formatPlateNumber(plate.getPlateStr());
+            if (formattedPlate.isEmpty()) {
+                resultLabel->setText("识别结果无效，请尝试更清晰的图片");
+                QMessageBox::warning(&bindDialog, "识别失败", "未能识别出有效车牌。");
+                return;
+            }
             
             resultLabel->setText(QString("识别成功: %1").arg(formattedPlate));
 
-            Vehicle *vehicle = DataManager::instance().findVehicleByPlate(formattedPlate);
+            auto vehicle = DataManager::instance().findVehicleByPlate(formattedPlate);
             if (vehicle) {
-                if (!vehicle->owner.isEmpty()) {
+                if (!vehicle->owner.isEmpty() && vehicle->owner != m_currentUser.username) {
                     QMessageBox::warning(this, "绑定失败", QString("车辆 %1 已被用户 %2 绑定。").arg(formattedPlate).arg(vehicle->owner));
-                    delete vehicle;
+                    return;
+                }
+                if (vehicle->owner == m_currentUser.username) {
+                    QMessageBox::information(this, "绑定成功", QString("车辆 %1 已绑定到您的账户。").arg(formattedPlate));
+                    bindDialog.accept();
                     return;
                 }
 
@@ -951,7 +1020,6 @@ void MainWindow::on_pushButtonIntelligentBind_clicked()
                 } else {
                     QMessageBox::warning(this, "绑定失败", "更新车辆信息时出错。");
                 }
-                delete vehicle;
             } else {
                 QMessageBox::warning(this, "绑定失败", "未在停车场中找到该车牌号的车辆，请确认车辆已入场。");
             }
@@ -975,7 +1043,7 @@ void MainWindow::on_pushButtonIntelligentQuery_clicked()
     // Image preview
     QLabel *imagePreviewLabel = new QLabel();
     imagePreviewLabel->setFixedSize(400, 300);
-    imagePreviewLabel->setStyleSheet("border: 1px solid #4f5b6a; background-color: #2d2d2d;");
+    imagePreviewLabel->setStyleSheet("border: 1px solid #49454F; border-radius: 16px; background-color: #211F26; color: #938F99;");
     imagePreviewLabel->setAlignment(Qt::AlignCenter);
     imagePreviewLabel->setText("图片预览");
 
@@ -1007,11 +1075,20 @@ void MainWindow::on_pushButtonIntelligentQuery_clicked()
         pr.setDetectType(PR_DETECT_CMSER | PR_DETECT_COLOR);
         std::vector<CPlate> plateVec;
         cv::Mat image = cv::imread(filePath.toStdString());
+        if (image.empty()) {
+            QMessageBox::warning(&queryDialog, "识别失败", "无法读取所选图片。");
+            return;
+        }
         int result = pr.plateRecognize(image, plateVec);
 
         if (result == 0 && !plateVec.empty()) {
             CPlate plate = plateVec.front();
             QString formattedPlate = formatPlateNumber(plate.getPlateStr());
+            if (formattedPlate.isEmpty()) {
+                resultLabel->setText("识别结果无效，请尝试更清晰的图片");
+                QMessageBox::warning(&queryDialog, "识别失败", "未能识别出有效车牌。");
+                return;
+            }
             
             resultLabel->setText(QString("识别成功: %1").arg(formattedPlate));
 

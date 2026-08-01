@@ -13,6 +13,7 @@ struct Vehicle {
     QString vehicle_type;
     QString vehicle_color;
     QDateTime pass_expiry_date;
+    double fee = 0.0; // 离场结算费用（历史记录用）
 
     bool isMonthlyPassHolder() const {
         return pass_expiry_date.isValid() && QDateTime::currentDateTime() < pass_expiry_date;

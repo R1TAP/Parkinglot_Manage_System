@@ -1,8 +1,12 @@
 #include "core/datamanager.h"
+#include "core/plateutil.h"
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QVariant>
 #include <QDebug>
+#include <QCryptographicHash>
+#include <QCoreApplication>
+#include <QDir>
 
 DataManager &DataManager::instance()
 {
@@ -21,9 +25,6 @@ DataManager::~DataManager()
         m_db.close();
     }
 }
-
-#include <QCoreApplication>
-#include <QDir>
 
 void DataManager::initDatabase()
 {
@@ -99,11 +100,52 @@ void DataManager::initDatabase()
                     "duration INTEGER)")) {
         qWarning() << "Couldn't create the transactions table:" << query.lastError();
     }
-    
+
+    // 停车历史表：临时车离场不再物理消失
+    if (!query.exec("CREATE TABLE IF NOT EXISTS parking_history ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "plate TEXT NOT NULL, "
+                    "owner TEXT, "
+                    "vehicle_type TEXT, "
+                    "vehicle_color TEXT, "
+                    "entry_time TEXT NOT NULL, "
+                    "exit_time TEXT NOT NULL, "
+                    "fee REAL NOT NULL DEFAULT 0)")) {
+        qWarning() << "Couldn't create the parking_history table:" << query.lastError();
+    }
+
+    // 配置表（车位容量等）
+    if (!query.exec("CREATE TABLE IF NOT EXISTS settings ("
+                    "key TEXT PRIMARY KEY, "
+                    "value TEXT NOT NULL)")) {
+        qWarning() << "Couldn't create the settings table:" << query.lastError();
+    }
+    if (!query.exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('total_spaces', '50')")) {
+        qWarning() << "Couldn't init settings table:" << query.lastError();
+    }
+
+    // 历史数据迁移：去掉旧格式车牌里的冒号（苏A:12345 -> 苏A12345）
+    const char *normalizeSql[] = {
+        "UPDATE vehicles SET plate = REPLACE(REPLACE(plate, ':', ''), '：', '')",
+        "UPDATE transactions SET plate = REPLACE(REPLACE(plate, ':', ''), '：', '')",
+        "UPDATE parking_history SET plate = REPLACE(REPLACE(plate, ':', ''), '：', '')"
+    };
+    for (const char *sql : normalizeSql) {
+        if (!query.exec(sql)) {
+            qWarning() << "Couldn't normalize legacy plates:" << query.lastError();
+        }
+    }
+
     // Add root user if not exists
     if (!isUsernameTaken("root")) {
         addUser("root", "password");
     }
+}
+
+QString DataManager::hashPassword(const QString &password)
+{
+    return QString::fromLatin1(
+        QCryptographicHash::hash(password.toUtf8(), QCryptographicHash::Sha256).toHex());
 }
 
 UserRole DataManager::validateUser(const QString &username, const QString &password, User *outUser)
@@ -112,10 +154,22 @@ UserRole DataManager::validateUser(const QString &username, const QString &passw
     query.prepare("SELECT username, password, role FROM users WHERE username = :username");
     query.bindValue(":username", username);
     if (query.exec() && query.next()) {
-        if (query.value(1).toString() == password) {
+        const QString stored = query.value(1).toString();
+        const QString hashed = hashPassword(password);
+        if (stored == password || stored == hashed) {
+            // 老库中是明文密码：登录成功后自动升级为哈希存储
+            if (stored == password) {
+                QSqlQuery upgrade;
+                upgrade.prepare("UPDATE users SET password = :password WHERE username = :username");
+                upgrade.bindValue(":password", hashed);
+                upgrade.bindValue(":username", username);
+                if (!upgrade.exec()) {
+                    qWarning() << "Couldn't upgrade password hash:" << upgrade.lastError();
+                }
+            }
             if (outUser) {
                 outUser->username = query.value(0).toString();
-                outUser->password = query.value(1).toString();
+                outUser->password = hashed;
                 outUser->role = static_cast<UserRole>(query.value(2).toInt());
             }
             return static_cast<UserRole>(query.value(2).toInt());
@@ -126,14 +180,14 @@ UserRole DataManager::validateUser(const QString &username, const QString &passw
 
 bool DataManager::addUser(const QString &username, const QString &password)
 {
-    if (isUsernameTaken(username)) {
+    if (isUsernameTaken(username) || password.isEmpty()) {
         return false;
     }
 
     QSqlQuery query;
     query.prepare("INSERT INTO users (username, password, role) VALUES (:username, :password, :role)");
     query.bindValue(":username", username);
-    query.bindValue(":password", password);
+    query.bindValue(":password", hashPassword(password));
     // New users are visitors, unless it's the root user being created for the first time
     query.bindValue(":role", (username == "root") ? static_cast<int>(UserRole::Admin) : static_cast<int>(UserRole::Visitor));
 
@@ -180,7 +234,7 @@ QVector<User> DataManager::getUsers()
     while (query.next()) {
         User u;
         u.username = query.value(0).toString();
-        u.password = query.value(1).toString();
+        u.password.clear(); // 不再把密码回显到界面
         u.role = static_cast<UserRole>(query.value(2).toInt());
         users.append(u);
     }
@@ -189,13 +243,27 @@ QVector<User> DataManager::getUsers()
 
 bool DataManager::updateUser(const User &user)
 {
-    if (user.username == "root") return false; // Cannot modify root
-
     QSqlQuery query;
-    query.prepare("UPDATE users SET password = :password, role = :role WHERE username = :username");
-    query.bindValue(":password", user.password);
-    query.bindValue(":role", static_cast<int>(user.role));
-    query.bindValue(":username", user.username);
+    if (user.username == "root") {
+        // root 不允许被其他入口修改角色，但允许通过改密弹窗更新密码
+        if (user.password.isEmpty()) {
+            return true;
+        }
+        query.prepare("UPDATE users SET password = :password WHERE username = :username");
+        query.bindValue(":password", hashPassword(user.password));
+        query.bindValue(":username", user.username);
+    } else if (user.password.isEmpty()) {
+        // 管理端编辑用户时密码留空 = 保持原密码
+        query.prepare("UPDATE users SET role = :role WHERE username = :username");
+        query.bindValue(":role", static_cast<int>(user.role));
+        query.bindValue(":username", user.username);
+    } else {
+        query.prepare("UPDATE users SET password = :password, role = :role WHERE username = :username");
+        query.bindValue(":password", hashPassword(user.password));
+        query.bindValue(":role", static_cast<int>(user.role));
+        query.bindValue(":username", user.username);
+    }
+
     if (!query.exec()) {
         qWarning() << "Couldn't update user:" << query.lastError();
         return false;
@@ -219,25 +287,32 @@ bool DataManager::deleteUser(const QString &username)
 
 void DataManager::addVehicle(const Vehicle &vehicle)
 {
-    Vehicle* existingVehicle = findVehicleByPlate(vehicle.plate);
+    Vehicle v = vehicle;
+    v.plate = normalizePlate(v.plate);
+    if (!isValidPlate(v.plate)) {
+        qWarning() << "拒绝录入非法车牌:" << v.plate;
+        return;
+    }
+
+    QSharedPointer<Vehicle> existingVehicle = findVehicleByPlate(v.plate);
     QSqlQuery query;
 
     if (existingVehicle) {
-        // If vehicle exists, just update its entry time and owner (i.e., start a new session)
-        delete existingVehicle; // free memory from findVehicleByPlate
+        // 已存在记录：更新入场时间；owner 为空时保留原车主（智能入场不“解绑”）
+        QString owner = v.owner.isEmpty() ? existingVehicle->owner : v.owner;
         query.prepare("UPDATE vehicles SET owner = :owner, entryTime = :entryTime WHERE plate = :plate");
-        query.bindValue(":owner", vehicle.owner);
-        query.bindValue(":entryTime", vehicle.entryTime.toString(Qt::ISODate));
-        query.bindValue(":plate", vehicle.plate);
+        query.bindValue(":owner", owner);
+        query.bindValue(":entryTime", v.entryTime.toString(Qt::ISODate));
+        query.bindValue(":plate", v.plate);
     } else {
-        // If vehicle does not exist, insert a new record
+        // 新记录：插入
         query.prepare("INSERT INTO vehicles (plate, owner, entryTime, vehicle_type, vehicle_color) "
-                        "VALUES (:plate, :owner, :entryTime, :vehicle_type, :vehicle_color)");
-        query.bindValue(":plate", vehicle.plate);
-        query.bindValue(":owner", vehicle.owner);
-        query.bindValue(":entryTime", vehicle.entryTime.toString(Qt::ISODate));
-        query.bindValue(":vehicle_type", vehicle.vehicle_type);
-        query.bindValue(":vehicle_color", vehicle.vehicle_color);
+                      "VALUES (:plate, :owner, :entryTime, :vehicle_type, :vehicle_color)");
+        query.bindValue(":plate", v.plate);
+        query.bindValue(":owner", v.owner);
+        query.bindValue(":entryTime", v.entryTime.toString(Qt::ISODate));
+        query.bindValue(":vehicle_type", v.vehicle_type);
+        query.bindValue(":vehicle_color", v.vehicle_color);
     }
 
     if (!query.exec()) {
@@ -263,14 +338,18 @@ QVector<Vehicle> DataManager::getVehicles()
     return vehicles;
 }
 
-// Note: This function now returns a dynamically allocated object. The caller is responsible for deleting it.
-Vehicle* DataManager::findVehicleByPlate(const QString &plate)
+QSharedPointer<Vehicle> DataManager::findVehicleByPlate(const QString &plate)
 {
+    const QString key = normalizePlate(plate);
+    if (key.isEmpty()) {
+        return QSharedPointer<Vehicle>();
+    }
+
     QSqlQuery query;
     query.prepare("SELECT plate, owner, entryTime, vehicle_type, pass_expiry_date, vehicle_color FROM vehicles WHERE plate = :plate");
-    query.bindValue(":plate", plate);
+    query.bindValue(":plate", key);
     if (query.exec() && query.next()) {
-        Vehicle *v = new Vehicle();
+        QSharedPointer<Vehicle> v(new Vehicle());
         v->plate = query.value(0).toString();
         v->owner = query.value(1).toString();
         v->entryTime = QDateTime::fromString(query.value(2).toString(), Qt::ISODate);
@@ -279,17 +358,22 @@ Vehicle* DataManager::findVehicleByPlate(const QString &plate)
         v->vehicle_color = query.value(5).toString();
         return v;
     }
-    return nullptr;
+    return QSharedPointer<Vehicle>();
 }
 
 bool DataManager::updateVehicle(const Vehicle &vehicle)
 {
+    const QString key = normalizePlate(vehicle.plate);
+    if (key.isEmpty()) {
+        return false;
+    }
+
     QSqlQuery query;
     query.prepare("UPDATE vehicles SET owner = :owner, vehicle_type = :vehicle_type, vehicle_color = :vehicle_color WHERE plate = :plate");
     query.bindValue(":owner", vehicle.owner);
     query.bindValue(":vehicle_type", vehicle.vehicle_type);
     query.bindValue(":vehicle_color", vehicle.vehicle_color);
-    query.bindValue(":plate", vehicle.plate);
+    query.bindValue(":plate", key);
     if (!query.exec()) {
         qWarning() << "Couldn't update vehicle:" << query.lastError();
         return false;
@@ -299,9 +383,14 @@ bool DataManager::updateVehicle(const Vehicle &vehicle)
 
 bool DataManager::deleteVehicle(const QString &plate)
 {
+    const QString key = normalizePlate(plate);
+    if (key.isEmpty()) {
+        return false;
+    }
+
     QSqlQuery query;
     query.prepare("DELETE FROM vehicles WHERE plate = :plate");
-    query.bindValue(":plate", plate);
+    query.bindValue(":plate", key);
     if (!query.exec()) {
         qWarning() << "Couldn't delete vehicle:" << query.lastError();
         return false;
@@ -311,12 +400,19 @@ bool DataManager::deleteVehicle(const QString &plate)
 
 bool DataManager::upgradeToMonthlyPass(const QString &plate, int daysToAdd)
 {
-    QDateTime expiryDate = QDateTime::currentDateTime().addDays(daysToAdd);
+    // 续费叠加：以「现有到期日与当前时间中较晚者」为起点加天数，避免未到期续费损失天数
+    QDateTime base = QDateTime::currentDateTime();
+    QSharedPointer<Vehicle> existing = findVehicleByPlate(plate);
+    if (existing && existing->pass_expiry_date.isValid() && existing->pass_expiry_date > base) {
+        base = existing->pass_expiry_date;
+    }
+    const QDateTime expiryDate = base.addDays(daysToAdd);
+
     QSqlQuery query;
     query.prepare("UPDATE vehicles SET pass_expiry_date = :expiry, entryTime = :entry WHERE plate = :plate");
     query.bindValue(":expiry", expiryDate.toString(Qt::ISODate));
     query.bindValue(":entry", QDateTime::currentDateTime().toString(Qt::ISODate)); // Reset entry time to clear old fees
-    query.bindValue(":plate", plate);
+    query.bindValue(":plate", normalizePlate(plate));
 
     if (!query.exec()) {
         qWarning() << "Couldn't upgrade to monthly pass:" << query.lastError();
@@ -327,34 +423,72 @@ bool DataManager::upgradeToMonthlyPass(const QString &plate, int daysToAdd)
 
 void DataManager::endParkingSession(const QString &plate)
 {
-    Vehicle* vehicle = findVehicleByPlate(plate);
+    const QString key = normalizePlate(plate);
+    QSharedPointer<Vehicle> vehicle = findVehicleByPlate(key);
     if (!vehicle) {
         return; // Vehicle not found, nothing to do
     }
 
-    bool isMonthly = vehicle->pass_expiry_date.isValid() && QDateTime::currentDateTime() < vehicle->pass_expiry_date;
+    const bool isMonthly = vehicle->isMonthlyPassHolder();
 
     if (isMonthly) {
         // For monthly pass holders, just clear the entry time to mark them as not parked
         QSqlQuery query;
         query.prepare("UPDATE vehicles SET entryTime = '' WHERE plate = :plate");
-        query.bindValue(":plate", plate);
+        query.bindValue(":plate", key);
         if (!query.exec()) {
             qWarning() << "Couldn't end parking session for monthly vehicle:" << query.lastError();
         }
-    } else {
-        // For temporary vehicles, delete the record entirely
-        deleteVehicle(plate);
+        return;
     }
-    delete vehicle; // Clean up memory from findVehicleByPlate
+
+    // 临时车：先写入停车历史，再删除在场记录
+    QSqlQuery history;
+    history.prepare("INSERT INTO parking_history (plate, owner, vehicle_type, vehicle_color, entry_time, exit_time, fee) "
+                    "VALUES (:plate, :owner, :vehicle_type, :vehicle_color, :entry_time, :exit_time, :fee)");
+    history.bindValue(":plate", key);
+    history.bindValue(":owner", vehicle->owner);
+    history.bindValue(":vehicle_type", vehicle->vehicle_type);
+    history.bindValue(":vehicle_color", vehicle->vehicle_color);
+    history.bindValue(":entry_time", vehicle->entryTime.toString(Qt::ISODate));
+    history.bindValue(":exit_time", QDateTime::currentDateTime().toString(Qt::ISODate));
+    history.bindValue(":fee", vehicle->calculateFee());
+    if (!history.exec()) {
+        qWarning() << "Couldn't archive parking session:" << history.lastError();
+    }
+
+    deleteVehicle(key);
+}
+
+QVector<Vehicle> DataManager::getParkingHistory(int limit) const
+{
+    QVector<Vehicle> vehicles;
+    QSqlQuery query;
+    query.prepare("SELECT plate, owner, entry_time, exit_time, vehicle_type, vehicle_color, fee "
+                  "FROM parking_history ORDER BY id DESC LIMIT :limit");
+    query.bindValue(":limit", limit);
+    if (query.exec()) {
+        while (query.next()) {
+            Vehicle v;
+            v.plate = query.value(0).toString();
+            v.owner = query.value(1).toString();
+            v.entryTime = QDateTime::fromString(query.value(2).toString(), Qt::ISODate);
+            v.exitTime = QDateTime::fromString(query.value(3).toString(), Qt::ISODate);
+            v.vehicle_type = query.value(4).toString();
+            v.vehicle_color = query.value(5).toString();
+            v.fee = query.value(6).toDouble();
+            vehicles.append(v);
+        }
+    }
+    return vehicles;
 }
 
 void DataManager::logTransaction(const QString &plate, double amount, const QString &type, int duration)
 {
     QSqlQuery query;
     query.prepare("INSERT INTO transactions (plate, amount, timestamp, type, duration) "
-                    "VALUES (:plate, :amount, :timestamp, :type, :duration)");
-    query.bindValue(":plate", plate);
+                  "VALUES (:plate, :amount, :timestamp, :type, :duration)");
+    query.bindValue(":plate", normalizePlate(plate));
     query.bindValue(":amount", amount);
     query.bindValue(":timestamp", QDateTime::currentDateTime().toString(Qt::ISODate));
     query.bindValue(":type", type);
@@ -387,34 +521,48 @@ QMap<QString, double> DataManager::getDailyRevenue()
     QMap<QString, double> revenue;
     revenue.insert("temporary", 0.0);
     revenue.insert("monthly", 0.0);
-    QDate today = QDate::currentDate();
 
-    // Temporary revenue: Sum of all payments made today
+    const QDateTime dayStart(QDate::currentDate(), QTime(0, 0, 0));
+    const QDateTime dayEnd = dayStart.addDays(1);
+
+    // 临时车收入：只查今天的流水（SQL 侧过滤，不再全表拉到内存）
     QSqlQuery tempQuery;
-    tempQuery.prepare("SELECT amount, timestamp FROM transactions WHERE type = 'temporary'");
+    tempQuery.prepare("SELECT amount FROM transactions "
+                      "WHERE type = 'temporary' AND timestamp >= :start AND timestamp < :end");
+    tempQuery.bindValue(":start", dayStart.toString(Qt::ISODate));
+    tempQuery.bindValue(":end", dayEnd.toString(Qt::ISODate));
     if (tempQuery.exec()) {
         while (tempQuery.next()) {
-            QDateTime timestamp = QDateTime::fromString(tempQuery.value(1).toString(), Qt::ISODate);
-            if (timestamp.date() == today) {
-                revenue["temporary"] += tempQuery.value(0).toDouble();
-            }
+            revenue["temporary"] += tempQuery.value(0).toDouble();
         }
     }
 
-    // Monthly revenue: Add daily rate for all currently active monthly passes
+    // 月卡收入：按“今天处于生效期”的月卡均摊日收入
     QSqlQuery monthlyQuery;
-    monthlyQuery.prepare("SELECT amount, timestamp, duration FROM transactions WHERE type = 'monthly'");
+    monthlyQuery.prepare("SELECT amount, timestamp, duration FROM transactions "
+                         "WHERE type = 'monthly' AND timestamp < :end");
+    monthlyQuery.bindValue(":end", dayEnd.toString(Qt::ISODate));
     if (monthlyQuery.exec()) {
         while (monthlyQuery.next()) {
             QDateTime startDate = QDateTime::fromString(monthlyQuery.value(1).toString(), Qt::ISODate);
             int duration = monthlyQuery.value(2).toInt();
             if (duration > 0) {
                 QDateTime endDate = startDate.addDays(duration);
-                if (today >= startDate.date() && today < endDate.date()) {
-                     revenue["monthly"] += monthlyQuery.value(0).toDouble() / duration;
+                if (QDate::currentDate() >= startDate.date() && QDate::currentDate() < endDate.date()) {
+                    revenue["monthly"] += monthlyQuery.value(0).toDouble() / duration;
                 }
             }
         }
     }
     return revenue;
+}
+
+int DataManager::parkingCapacity() const
+{
+    QSqlQuery query("SELECT value FROM settings WHERE key = 'total_spaces'");
+    if (query.exec() && query.next()) {
+        int capacity = query.value(0).toInt();
+        return capacity > 0 ? capacity : 50;
+    }
+    return 50;
 }

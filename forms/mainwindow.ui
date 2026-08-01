@@ -373,21 +373,15 @@
            </item>
            <item>
             <widget class="QLabel" name="occupancyBarLabel">
-             <property name="minimumSize">
-              <size>
-               <width>0</width>
-               <height>20</height>
-              </size>
-             </property>
-             <property name="styleSheet">
-              <string notr="true">QWidget{
-border-radius：20px
-}
-</string>
-             </property>
-             <property name="text">
-              <string/>
-             </property>
+            <property name="minimumSize">
+             <size>
+              <width>0</width>
+              <height>20</height>
+             </size>
+            </property>
+            <property name="text">
+             <string/>
+            </property>
             </widget>
            </item>
           </layout>

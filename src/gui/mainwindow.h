@@ -54,6 +54,7 @@ private:
   Ui::MainWindow *ui;
   QTimer *m_feeUpdateTimer;
   User m_currentUser;
+  QString m_queriedPlate; // 查询结果中的纯文本车牌（避免取到富文本 HTML）
 };
 
 #endif // MAINWINDOW_H

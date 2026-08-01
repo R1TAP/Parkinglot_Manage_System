@@ -36,7 +36,7 @@ void UserDialog::setUser(const User &user)
 {
     ui->lineEditUser->setText(user.username);
     ui->lineEditUser->setReadOnly(true); // Username is primary key, should not be changed
-    ui->lineEditPassword->setText(user.password);
+    ui->lineEditPassword->clear(); // 密码不回显；留空提交 = 保持原密码
     int index = ui->comboBoxRole->findData(static_cast<int>(user.role));
     if (index != -1) {
         ui->comboBoxRole->setCurrentIndex(index);

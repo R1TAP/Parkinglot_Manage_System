@@ -65,7 +65,7 @@
          </font>
         </property>
         <property name="styleSheet">
-         <string notr="true">color: #2ecc71;</string>
+         <string notr="true">color: #8CE0A8;</string>
         </property>
         <property name="text">
          <string>300元</string>
@@ -104,11 +104,11 @@
             <bold>true</bold>
            </font>
           </property>
-          <property name="styleSheet">
-           <string notr="true">color: #2ecc71;</string>
-          </property>
-          <property name="text">
-           <string>800元</string>
+         <property name="styleSheet">
+          <string notr="true">color: #8CE0A8;</string>
+         </property>
+         <property name="text">
+          <string>800元</string>
           </property>
          </widget>
         </item>
@@ -127,11 +127,11 @@
         </item>
         <item>
          <widget class="QLabel" name="labelQuarterDiscount">
-          <property name="styleSheet">
-           <string notr="true">color: grey;</string>
-          </property>
-          <property name="text">
-           <string>-20% off</string>
+         <property name="styleSheet">
+          <string notr="true">color: #938F99;</string>
+         </property>
+         <property name="text">
+          <string>-20% off</string>
           </property>
          </widget>
         </item>
@@ -170,10 +170,10 @@
            </font>
           </property>
           <property name="styleSheet">
-           <string notr="true">color: #2ecc71;</string>
+          <string notr="true">color: #8CE0A8;</string>
           </property>
           <property name="text">
-           <string>2500元</string>
+          <string>2500元</string>
           </property>
          </widget>
         </item>
@@ -192,11 +192,11 @@
         </item>
         <item>
          <widget class="QLabel" name="labelYearDiscount">
-          <property name="styleSheet">
-           <string notr="true">color: grey;</string>
-          </property>
-          <property name="text">
-           <string>-30% off</string>
+         <property name="styleSheet">
+          <string notr="true">color: #938F99;</string>
+         </property>
+         <property name="text">
+          <string>-30% off</string>
           </property>
          </widget>
         </item>
